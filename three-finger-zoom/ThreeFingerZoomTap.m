@@ -12,8 +12,13 @@
 //
 // Сборка (на macOS):
 //   clang -fobjc-arc -O2 ThreeFingerZoomTap.m -o three-finger-zoom-tap \
-//     -F/System/Library/PrivateFrameworks -framework MultitouchSupport \
 //     -framework Foundation -framework AppKit -framework ApplicationServices
+//
+// Приватный MultitouchSupport.framework загружается через dlopen/dlsym:
+// начиная с Big Sur системные библиотеки живут в dyld shared cache, бинаря
+// на диске нет, и обычная линковка `-framework MultitouchSupport` не работает
+// (приватным фреймворкам Apple не кладёт .tbd-заглушки в SDK). dlopen при
+// этом штатно резолвит путь через shared cache.
 //
 // Перед запуском:
 //   1. System Settings → Trackpad → More Gestures: Mission Control, App Exposé
@@ -26,14 +31,18 @@
 //      Security → Accessibility) — нужно для event tap.
 //
 // Приватный API используется в одном-единственном месте: счётчик пальцев
-// на трекпаде (MultitouchSupport.framework). Сами события не трогаем ничем,
-// кроме OR одного бита флагов.
+// на трекпаде. Сами события не трогаем ничем, кроме OR одного бита флагов.
+// Логика решения «этот жест — зум» вынесена в gesture_logic.h и покрыта
+// юнит-тестами (test_gesture_logic.c), запускаемыми на любой платформе.
 
 #import <Foundation/Foundation.h>
 #import <AppKit/AppKit.h>
 #import <ApplicationServices/ApplicationServices.h>
+#import <dlfcn.h>
 
-#pragma mark - MultitouchSupport (private): нужен только счётчик пальцев
+#include "gesture_logic.h"
+
+#pragma mark - MultitouchSupport (private, via dlopen): нужен только счётчик пальцев
 
 typedef struct { float x, y; } MTPoint;
 typedef struct { MTPoint pos, vel; } MTReadout;
@@ -54,10 +63,9 @@ typedef struct {
 typedef void *MTDeviceRef;
 typedef int (*MTContactCallback)(MTDeviceRef, MTTouch *, int32_t, double, int32_t);
 
-extern MTDeviceRef MTDeviceCreateDefault(void);
-extern void MTRegisterContactFrameCallback(MTDeviceRef, MTContactCallback);
-extern void MTDeviceStart(MTDeviceRef, int);
-extern void MTDeviceStop(MTDeviceRef);
+typedef MTDeviceRef (*MTDeviceCreateDefaultFn)(void);
+typedef void (*MTRegisterContactFrameCallbackFn)(MTDeviceRef, MTContactCallback);
+typedef void (*MTDeviceStartFn)(MTDeviceRef, int);
 
 static volatile int32_t gFingersOnPad = 0;
 
@@ -75,9 +83,9 @@ static NSArray<NSString *> *AllowedBundleIDs(void) {
     return @[];
 }
 
-static BOOL FrontmostAppAllowed(void) {
+static bool FrontmostAppAllowed(void) {
     NSArray *allowed = AllowedBundleIDs();
-    if (allowed.count == 0) return YES;
+    if (allowed.count == 0) return true;
     NSString *bid = NSWorkspace.sharedWorkspace.frontmostApplication.bundleIdentifier;
     return bid != nil && [allowed containsObject:bid];
 }
@@ -85,11 +93,7 @@ static BOOL FrontmostAppAllowed(void) {
 #pragma mark - Event tap: помечаем настоящие скроллы флагом Cmd
 
 static CFMachPortRef gTap = NULL;
-
-// Решение «этот жест — зум» принимается в активной фазе и удерживается
-// на время инерции (когда пальцы уже подняты, но система продолжает слать
-// momentum-события): иначе зум на лету превращался бы в прокрутку.
-static BOOL gFlagThisGesture = NO;
+static gl_state gGesture = {0};
 
 static CGEventRef TapCallback(CGEventTapProxy proxy, CGEventType type,
                               CGEventRef event, void *refcon) {
@@ -107,18 +111,8 @@ static CGEventRef TapCallback(CGEventTapProxy proxy, CGEventType type,
     int64_t scrollPhase   = CGEventGetIntegerValueField(event, kCGScrollWheelEventScrollPhase);
     int64_t momentumPhase = CGEventGetIntegerValueField(event, kCGScrollWheelEventMomentumPhase);
 
-    if (momentumPhase == kCGMomentumScrollPhaseNone) {
-        // Активная фаза жеста: смотрим на реальное число пальцев.
-        if (scrollPhase == kCGScrollPhaseMayBegin || scrollPhase == kCGScrollPhaseBegan) {
-            gFlagThisGesture = (gFingersOnPad == 3) && FrontmostAppAllowed();
-        } else if (gFingersOnPad == 3 && FrontmostAppAllowed()) {
-            gFlagThisGesture = YES; // третий палец добавили уже по ходу жеста
-        }
-    }
-    // momentumPhase != none: пальцев на трекпаде уже нет — держим решение
-    // активной фазы до конца инерции.
-
-    if (gFlagThisGesture) {
+    if (gl_should_flag(&gGesture, scrollPhase, momentumPhase,
+                       gFingersOnPad, FrontmostAppAllowed())) {
         CGEventSetFlags(event, CGEventGetFlags(event) | kCGEventFlagMaskCommand);
     }
     return event;
@@ -134,13 +128,30 @@ int main(void) {
             NSLog(@"Выдайте разрешение Accessibility и перезапустите утилиту.");
         }
 
-        MTDeviceRef device = MTDeviceCreateDefault();
+        void *mtLib = dlopen(
+            "/System/Library/PrivateFrameworks/MultitouchSupport.framework/MultitouchSupport",
+            RTLD_NOW);
+        if (mtLib == NULL) {
+            NSLog(@"Не удалось загрузить MultitouchSupport.framework: %s", dlerror());
+            return 1;
+        }
+        MTDeviceCreateDefaultFn createDefault =
+            (MTDeviceCreateDefaultFn)dlsym(mtLib, "MTDeviceCreateDefault");
+        MTRegisterContactFrameCallbackFn registerCallback =
+            (MTRegisterContactFrameCallbackFn)dlsym(mtLib, "MTRegisterContactFrameCallback");
+        MTDeviceStartFn deviceStart = (MTDeviceStartFn)dlsym(mtLib, "MTDeviceStart");
+        if (!createDefault || !registerCallback || !deviceStart) {
+            NSLog(@"Символы MultitouchSupport не найдены (изменился приватный API?)");
+            return 1;
+        }
+
+        MTDeviceRef device = createDefault();
         if (device == NULL) {
             NSLog(@"Мультитач-устройство не найдено.");
             return 1;
         }
-        MTRegisterContactFrameCallback(device, ContactCallback);
-        MTDeviceStart(device, 0);
+        registerCallback(device, ContactCallback);
+        deviceStart(device, 0);
 
         gTap = CGEventTapCreate(kCGSessionEventTap, kCGHeadInsertEventTap,
                                 kCGEventTapOptionDefault,
@@ -157,8 +168,6 @@ int main(void) {
 
         NSLog(@"Готово: 3 пальца вверх/вниз = нативный zoom (⌘ добавляется к настоящему скроллу). Ctrl+C — выход.");
         CFRunLoopRun();
-
-        MTDeviceStop(device);
     }
     return 0;
 }

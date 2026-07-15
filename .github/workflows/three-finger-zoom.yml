@@ -1,0 +1,66 @@
+name: three-finger-zoom-ci
+
+on:
+  push:
+    branches: [claude/mac-three-finger-zoom-yaf07i]
+    paths:
+      - 'three-finger-zoom/**'
+      - '.github/workflows/three-finger-zoom.yml'
+  workflow_dispatch:
+
+jobs:
+  logic-tests-linux:
+    name: Gesture logic tests (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and run unit tests
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror \
+            -o test_gesture_logic three-finger-zoom/test_gesture_logic.c
+          ./test_gesture_logic
+
+  build-macos:
+    name: Build and smoke-run on real macOS
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compile ThreeFingerZoomTap (variant D)
+        working-directory: three-finger-zoom
+        run: |
+          clang -fobjc-arc -O2 ThreeFingerZoomTap.m -o three-finger-zoom-tap \
+            -framework Foundation -framework AppKit -framework ApplicationServices
+
+      - name: Compile ThreeFingerZoom (variant C)
+        working-directory: three-finger-zoom
+        run: |
+          clang -fobjc-arc -O2 ThreeFingerZoom.m -o three-finger-zoom \
+            -framework Foundation -framework ApplicationServices
+
+      - name: Typecheck CanvasZoomView (variant B)
+        working-directory: three-finger-zoom
+        run: swiftc -typecheck CanvasZoomView.swift
+
+      - name: Run gesture logic tests on macOS
+        working-directory: three-finger-zoom
+        run: |
+          cc -std=c11 -Wall -Wextra -Werror \
+            -o test_gesture_logic test_gesture_logic.c
+          ./test_gesture_logic
+
+      # На CI-раннере нет ни мультитач-трекпада, ни разрешения Accessibility,
+      # поэтому проверяем только, что бинарь запускается и корректно сообщает
+      # об отсутствии устройства/разрешений, а не падает.
+      - name: Smoke-run variant D binary
+        working-directory: three-finger-zoom
+        run: |
+          set +e
+          ./three-finger-zoom-tap > out.log 2>&1 &
+          BIN_PID=$!
+          sleep 8
+          kill "$BIN_PID" 2>/dev/null
+          set -e
+          echo "--- output ---"
+          cat out.log
+          grep -Eq "Мультитач-устройство не найдено|Не удалось создать event tap|Выдайте разрешение|Готово|Символы MultitouchSupport" out.log

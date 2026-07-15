@@ -98,10 +98,15 @@ PoC: [`ThreeFingerZoom.m`](ThreeFingerZoom.m). Сборка и запуск (н�
 
 ```sh
 clang -fobjc-arc -O2 ThreeFingerZoom.m -o three-finger-zoom \
-  -F/System/Library/PrivateFrameworks -framework MultitouchSupport \
   -framework Foundation -framework ApplicationServices
 ./three-finger-zoom
 ```
+
+Приватный фреймворк загружается через `dlopen`/`dlsym`: начиная с Big Sur
+системные библиотеки живут в dyld shared cache, бинаря на диске нет, и обычная
+линковка `-framework MultitouchSupport` не работает (для приватных фреймворков
+Apple не кладёт .tbd-заглушки в SDK); `dlopen` при этом штатно резолвит путь
+через shared cache.
 
 Требования и риски:
 - разрешение **Accessibility** (System Settings → Privacy & Security →
@@ -152,7 +157,6 @@ apps на 4 пальца идеальный «трёхпальцевый скр�
 
 ```sh
 clang -fobjc-arc -O2 ThreeFingerZoomTap.m -o three-finger-zoom-tap \
-  -F/System/Library/PrivateFrameworks -framework MultitouchSupport \
   -framework Foundation -framework AppKit -framework ApplicationServices
 ./three-finger-zoom-tap
 ```
@@ -186,3 +190,32 @@ clang -fobjc-arc -O2 ThreeFingerZoomTap.m -o three-finger-zoom-tap \
 то вариант D: система сама делает идеальный трёхпальцевый скролл, а посредник
 лишь дорисовывает флаг ⌘. Вариант A остаётся самым быстрым компромиссом «за 15
 минут», вариант B — путь для своего приложения.
+
+## 8. Как это проверить без Мака («онлайн-эмуляция»)
+
+Полностью «пощупать» жест в эмуляции нельзя: мультитач-трекпад — физический
+сенсор, и ни одна виртуальная macOS его не эмулирует (Docker-OSX/UTM/облачные
+Mac от AWS/MacStadium — везде обычная мышь; браузерные «эмуляторы Mac» типа
+Infinite Mac — это старые Mac OS без трекпадов вовсе). Плюс лицензия Apple
+разрешает виртуализацию macOS только на железе Apple. Поэтому финальный тест
+look & feel возможен только на физическом Маке.
+
+Но проверить онлайн можно всё остальное — что и сделано:
+
+1. **Логика решения** «помечать ли скролл флагом ⌘» вынесена в чистый C без
+   Apple-зависимостей ([`gesture_logic.h`](gesture_logic.h)) и покрыта
+   юнит-тестами ([`test_gesture_logic.c`](test_gesture_logic.c)) — 6 сценариев,
+   включая удержание флага в инерции и сброс на новом жесте. Запускаются на
+   любой платформе.
+2. **Компиляция, линковка и запуск на настоящей macOS** — через GitHub Actions:
+   раннеры `macos-latest` — это реальные Mac (VM на Apple Silicon). Workflow
+   [`.github/workflows/three-finger-zoom.yml`](../.github/workflows/three-finger-zoom.yml)
+   собирает оба PoC, тайпчекает Swift-пример и делает smoke-run бинаря
+   (на раннере нет трекпада и разрешения Accessibility, поэтому проверяется
+   корректное сообщение об этом, а не работа жеста).
+
+Такая проверка уже окупилась: изначальная команда сборки линковала
+`-framework MultitouchSupport`, что на современных macOS (Big Sur+) не
+работает — бинари системных библиотек убраны с диска в dyld shared cache,
+а .tbd-заглушек для приватных фреймворков в SDK нет. Код переведён на
+`dlopen`/`dlsym` (так же поступают все живые проекты на этом API).
